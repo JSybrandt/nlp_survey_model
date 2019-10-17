@@ -5,6 +5,7 @@ from train import(
     iter_to_batches,
     get_args,
     denormalize_to_one_six,
+    bert_to_sentence_embeddings,
 )
 from transformers import BertModel, BertTokenizer
 from torch.nn.utils.rnn import pad_sequence
@@ -43,13 +44,18 @@ if __name__ == "__main__":
     line = line.strip().lower()
     sequences = pad_sequence(
       sequences=[
-        torch.tensor(tokenizer.encode(line)[:args.max_sequence_length])
+        torch.tensor(
+          tokenizer.encode(
+            line,
+            add_special_tokens=True
+          )[:args.max_sequence_length]
+        )
       ],
       batch_first=True,
     ).to(device)
-    embedding = embedding_model(sequences)[-1]
+    embeddings = bert_to_sentence_embeddings(embedding_model, sequences)
     relevant, activation, sentiment = (
-        survey_model(embedding).cpu().detach().tolist()[0]
+        survey_model(embeddings).cpu().detach().tolist()[0]
     )
     relevant = int(np.round(relevant))
     activation = denormalize_to_one_six(activation)

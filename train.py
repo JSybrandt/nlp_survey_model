@@ -23,15 +23,16 @@ class SurveyClassifier(torch.nn.Module):
     # TrainingData.labels (relevant, activation, sentiment)
 
     # input
-    self.l1 = torch.nn.Linear(BERT_OUTPUT_DIM, 128)
-    self.r1 = torch.nn.ReLU(inplace=True)
-    # batch 1
-    self.l2 = torch.nn.Linear(128, 3)
+    self.l1 = torch.nn.Linear(BERT_OUTPUT_DIM, 3)
+    # self.r1 = torch.nn.ReLU(inplace=True)
+    # # batch 1
+    # self.l2 = torch.nn.Linear(128, 3)
 
     # Order matters
     self.ops = [
-        self.l1, self.r1,
-        self.l2
+        self.l1,
+        # self.r1,
+        # self.l2
     ]
 
   def forward(self, x):
@@ -40,6 +41,12 @@ class SurveyClassifier(torch.nn.Module):
     return x
 
 ################################################################################
+
+def bert_to_sentence_embeddings(bert_model, sequences):
+  return (
+      bert_model(sequences)[-2]
+      .mean(axis=1)
+  )
 
 def normalize_to_zero_one(one_six):
   assert 1 <= one_six <= 6
@@ -96,10 +103,10 @@ def get_args():
       default=Path("./processed_data.pkl")
   )
   parser.add_argument("--model", type=Path, default=Path("./model.pt"))
-  parser.add_argument("--batch-size", type=int, default=32)
+  parser.add_argument("--batch-size", type=int, default=16)
   parser.add_argument("--disable-gpu", action="store_true")
   parser.add_argument("--epochs", type=int, default=100)
-  parser.add_argument("--max-sequence_length", type=int, default=500)
+  parser.add_argument("--max-sequence_length", type=int, default=400)
   parser.add_argument("--test-ratio", type=float, default=0.2)
   parser.add_argument("--validation-ratio", type=float, default=0.1)
   parser.add_argument("--learning-rate", type=float, default=0.02)
@@ -115,6 +122,7 @@ if __name__ == "__main__":
     device = torch.device("cuda")
   else:
     device = torch.device("cpu")
+    torch.cuda.empty_cache()
 
   if args.processed_data.is_file():
     print(f"Loading previously-processed data from {args.processed_data}")
@@ -159,12 +167,17 @@ if __name__ == "__main__":
     ):
       sequences = pad_sequence(
           sequences=[
-            torch.tensor(tokenizer.encode(b.text)[:args.max_sequence_length])
+            torch.tensor(tokenizer.encode(b.text, add_special_tokens=True)[:args.max_sequence_length])
             for b in batch
           ],
           batch_first=True,
       ).to(device)
-      embeddings = embedding_model(sequences)[-1].cpu().detach().numpy()
+      embeddings = (
+          bert_to_sentence_embeddings(embedding_model, sequences)
+          .cpu()
+          .detach()
+          .numpy()
+      )
       for element, embedding in zip(batch, embeddings):
         element.set_embedding(embedding)
 
