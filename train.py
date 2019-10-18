@@ -42,11 +42,25 @@ class SurveyClassifier(torch.nn.Module):
 
 ################################################################################
 
-def bert_to_sentence_embeddings(bert_model, sequences):
-  return (
-      bert_model(sequences)[-2]
-      .mean(axis=1)
-  )
+def bert_to_sentence_embeddings(bert_model, tokenizer, sequences):
+  return bert_model(sequences)[-2].mean(axis=1)
+
+  # bad_tokens = [
+      # tokenizer.pad_token_id,
+      # # tokenizer.unk_token_id,
+      # # tokenizer.sep_token_id,
+      # # tokenizer.cls_token_id,
+      # # tokenizer.mask_token_id,
+  # ]
+
+  # embedding = bert_model(sequences)[-2]
+  # mask = torch.ones(sequences.shape, dtype=bool, device=sequences.device)
+  # for bad_tok in bad_tokens:
+    # mask &= (sequences != bad_tok)
+  # mask = mask.unsqueeze(-1).expand_as(embedding)
+  # embedding *= mask
+  # return embedding.sum(axis=1) / mask.sum(axis=1)
+
 
 def normalize_to_zero_one(one_six):
   assert 1 <= one_six <= 6
@@ -167,13 +181,22 @@ if __name__ == "__main__":
     ):
       sequences = pad_sequence(
           sequences=[
-            torch.tensor(tokenizer.encode(b.text, add_special_tokens=True)[:args.max_sequence_length])
+            torch.tensor(
+              tokenizer.encode(
+                b.text,
+                add_special_tokens=True
+              )[:args.max_sequence_length]
+            )
             for b in batch
           ],
           batch_first=True,
       ).to(device)
       embeddings = (
-          bert_to_sentence_embeddings(embedding_model, sequences)
+          bert_to_sentence_embeddings(
+            embedding_model,
+            tokenizer,
+            sequences
+          )
           .cpu()
           .detach()
           .numpy()

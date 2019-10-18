@@ -53,7 +53,11 @@ if __name__ == "__main__":
       ],
       batch_first=True,
     ).to(device)
-    embeddings = bert_to_sentence_embeddings(embedding_model, sequences)
+    embeddings = bert_to_sentence_embeddings(
+        embedding_model,
+        tokenizer,
+        sequences
+    )
     relevant, activation, sentiment = (
         survey_model(embeddings).cpu().detach().tolist()[0]
     )
