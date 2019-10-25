@@ -12,7 +12,6 @@ from torch.nn.utils.rnn import pad_sequence
 import torch
 import sys
 import numpy as np
-from csv import DictReader
 
 if __name__ == "__main__":
   args = get_args()
@@ -40,31 +39,33 @@ if __name__ == "__main__":
   survey_model.load_state_dict(torch.load(args.model))
   survey_model = survey_model.eval().to(device)
 
-  assert args.raw_data.is_file()
-  with open(args.raw_data) as csv_file:
-    reader = DictReader(csv_file)
-    for row in reader:
-      line = row["text"].strip().lower()
-      sequences = pad_sequence(
-        sequences=[
-          torch.tensor(
-            tokenizer.encode(
-              line,
-              add_special_tokens=True
-            )[:args.max_sequence_length]
-          )
-        ],
-        batch_first=True,
-      ).to(device)
-      embeddings = bert_to_sentence_embeddings(
-          embedding_model,
-          tokenizer,
-          sequences
-      )
-      relevant, activation, sentiment = (
-          survey_model(embeddings).cpu().detach().tolist()[0]
-      )
-      relevant = int(np.round(relevant))
-      activation = denormalize_to_one_six(activation)
-      sentiment = denormalize_to_one_six(sentiment)
-      print(f"R:{relevant}, A:{activation}, S:{sentiment} {line}")
+  print("Press CTRL+D to stop reading. Assuming one text per line.")
+  for line in sys.stdin:
+    line = line.strip().lower()
+    sequences = pad_sequence(
+      sequences=[
+        torch.tensor(
+          tokenizer.encode(
+            line,
+            add_special_tokens=True
+          )[:args.max_sequence_length]
+        )
+      ],
+      batch_first=True,
+    ).to(device)
+    embeddings = bert_to_sentence_embeddings(
+        embedding_model,
+        tokenizer,
+        sequences
+    )
+    relevant, activation, sentiment = (
+        survey_model(embeddings).cpu().detach().tolist()[0]
+    )
+    relevant = int(np.round(relevant))
+    activation = denormalize_to_one_six(activation)
+    sentiment = denormalize_to_one_six(sentiment)
+    print(
+        f"Relevant: {relevant}, "
+        f"Activation: {activation}, "
+        f"Sentiment: {sentiment}"
+    )
