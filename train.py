@@ -11,7 +11,7 @@ from random import shuffle
 from torch.nn.utils.rnn import pad_sequence
 from itertools import zip_longest
 import pickle
-from copy import deepcopy
+from copy import deepcopy, copy
 import numpy as np
 
 BERT_OUTPUT_DIM = 768
@@ -23,16 +23,18 @@ class SurveyClassifier(torch.nn.Module):
     # TrainingData.labels (relevant, activation, sentiment)
 
     # input
-    self.l1 = torch.nn.Linear(BERT_OUTPUT_DIM, 3)
-    # self.r1 = torch.nn.ReLU(inplace=True)
+    self.l1 = torch.nn.Linear(BERT_OUTPUT_DIM, 16)
+    self.r1 = torch.nn.ReLU(inplace=True)
     # # batch 1
-    # self.l2 = torch.nn.Linear(128, 3)
+    self.l2 = torch.nn.Linear(16, 3)
+    self.r2 = torch.nn.ReLU(inplace=True)
 
     # Order matters
     self.ops = [
         self.l1,
-        # self.r1,
-        # self.l2
+        self.r1,
+        self.l2,
+        self.r2,
     ]
 
   def forward(self, x):
@@ -42,24 +44,23 @@ class SurveyClassifier(torch.nn.Module):
 
 ################################################################################
 
+def binary_accuracy(prediction, labels):
+  num_correct = ((prediction > 0.5) == (labels > 0.5)).sum()
+  return num_correct / prediction.numel()
+
+def per_class_accuracy(prediction, labels):
+  def denorm(val):
+    val = copy(val).detach()
+    val[val<0]=0
+    val[val>1]=1
+    val *= 5
+    val += 1
+    return val.round()
+  return (denorm(prediction) == denorm(labels)).sum() / prediction.numel()
+
+
 def bert_to_sentence_embeddings(bert_model, tokenizer, sequences):
-  return bert_model(sequences)[-2].mean(axis=1)
-
-  # bad_tokens = [
-      # tokenizer.pad_token_id,
-      # # tokenizer.unk_token_id,
-      # # tokenizer.sep_token_id,
-      # # tokenizer.cls_token_id,
-      # # tokenizer.mask_token_id,
-  # ]
-
-  # embedding = bert_model(sequences)[-2]
-  # mask = torch.ones(sequences.shape, dtype=bool, device=sequences.device)
-  # for bad_tok in bad_tokens:
-    # mask &= (sequences != bad_tok)
-  # mask = mask.unsqueeze(-1).expand_as(embedding)
-  # embedding *= mask
-  # return embedding.sum(axis=1) / mask.sum(axis=1)
+  return bert_model(sequences)[0].mean(axis=1)
 
 
 def normalize_to_zero_one(one_six):
@@ -122,8 +123,8 @@ def get_args():
   parser.add_argument("--epochs", type=int, default=100)
   parser.add_argument("--max-sequence_length", type=int, default=400)
   parser.add_argument("--test-ratio", type=float, default=0.2)
-  parser.add_argument("--validation-ratio", type=float, default=0.1)
-  parser.add_argument("--learning-rate", type=float, default=0.02)
+  parser.add_argument("--validation-ratio", type=float, default=0.2)
+  parser.add_argument("--learning-rate", type=float, default=0.001)
   return parser.parse_args()
 
 ################################################################################
@@ -265,6 +266,11 @@ if __name__ == "__main__":
           total=int(len(data)/float(args.batch_size)),
       )
       running_loss = 0.0
+      running_rel_2acc = 0.0
+      running_act_2acc = 0.0
+      running_sent_2acc = 0.0
+      running_act_6acc = 0.0
+      running_sent_6acc = 0.0
       running_count = 0.0
       for batch in pbar:
         batch_embeddings = (
@@ -278,14 +284,30 @@ if __name__ == "__main__":
         batch_predictions = model(batch_embeddings)
         batch_loss = loss_fn(batch_predictions, batch_labels)
 
+        running_rel_2acc += binary_accuracy(batch_predictions[:, 0], batch_labels[:, 0])
+        running_act_2acc += binary_accuracy(batch_predictions[:, 1], batch_labels[:, 1])
+        running_sent_2acc += binary_accuracy(batch_predictions[:, 2], batch_labels[:, 2])
+
+        running_act_6acc += per_class_accuracy(batch_predictions[:, 1], batch_labels[:, 1])
+        running_sent_6acc += per_class_accuracy(batch_predictions[:, 2], batch_labels[:, 2])
+
         if phase == "train":
           optimizer.zero_grad()
           batch_loss.backward()
           optimizer.step()
 
-        running_loss += batch_loss.detach() * len(batch)
-        running_count += len(batch)
-        pbar.set_description(f"{phase} -- Loss:{running_loss / running_count}")
+        running_loss += batch_loss.detach()
+        running_count += 1
+        pbar.set_description(
+            f"{phase}"
+            f" -- Loss:{running_loss / running_count:0.3f}"
+            f" -- Rel2:{running_rel_2acc / running_count:0.3f}"
+            f" -- Act2:{running_act_2acc / running_count:0.3f}"
+            f" -- Sen2:{running_sent_2acc / running_count:0.3f}"
+            f" -- Act6:{running_act_6acc / running_count:0.3f}"
+            f" -- Sen6:{running_sent_6acc / running_count:0.3f}"
+        )
+
       if phase == "validate":
         epoch_loss = running_loss / running_count
         if best_validation_loss is None or epoch_loss < best_validation_loss:
