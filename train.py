@@ -55,7 +55,12 @@ class SurveyClassifier(BertModel):
 
   def forward(self, *args, **kwargs):
     x =  super(SurveyClassifier, self).forward(*args, **kwargs)[0]
-    x = x.sum(dim=1) / x.shape[1]
+    attention_mask = kwargs["attention_mask"].unsqueeze(2)
+    assert x.shape[0] == attention_mask.shape[0]
+    assert x.shape[1] == attention_mask.shape[1]
+    assert attention_mask.shape[2] == 1
+    x *= attention_mask
+    x = x.sum(dim=1) / attention_mask.sum(dim=1)
     for op in self.ops:
       x = op(x)
     return x
