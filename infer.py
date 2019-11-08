@@ -12,59 +12,57 @@ from torch.nn.utils.rnn import pad_sequence
 import torch
 import sys
 import numpy as np
-from csv import DictReader
+from csv import DictReader, DictWriter
 
 if __name__ == "__main__":
   args = get_args()
 
-  print("Configuring pytorch")
   if torch.cuda.is_available() and not args.disable_gpu:
     device = torch.device("cuda")
   else:
     device = torch.device("cpu")
 
-  print(
-      f"Loading {args.pretrained_weights}. This will download weights the "
-      "first time."
-  )
   tokenizer = BertTokenizer.from_pretrained(args.pretrained_weights)
-  embedding_model = (
-      BertModel
-      .from_pretrained(args.pretrained_weights)
-      .eval()
-      .to(device)
-  )
-
-  print(f"Loading model from {args.model}")
-  survey_model = SurveyClassifier()
+  survey_model = SurveyClassifier.from_pretrained(args.pretrained_weights)
   survey_model.load_state_dict(torch.load(args.model))
   survey_model = survey_model.eval().to(device)
 
-  assert args.raw_data.is_file()
-  with open(args.raw_data) as csv_file:
-    reader = DictReader(csv_file)
-    for row in reader:
-      line = row["text"].strip().lower()
-      sequences = pad_sequence(
-        sequences=[
-          torch.tensor(
-            tokenizer.encode(
-              line,
-              add_special_tokens=True
-            )[:args.max_sequence_length]
-          )
-        ],
-        batch_first=True,
-      ).to(device)
-      embeddings = bert_to_sentence_embeddings(
-          embedding_model,
-          tokenizer,
-          sequences
-      )
-      relevant, activation, sentiment = (
-          survey_model(embeddings).cpu().detach().tolist()[0]
-      )
-      relevant = int(np.round(relevant))
-      activation = denormalize_to_one_six(activation)
-      sentiment = denormalize_to_one_six(sentiment)
-      print(f"R:{relevant}, A:{activation}, S:{sentiment} {line}")
+  for data_path in args.raw_data:
+    assert data_path.is_file()
+    with open(data_path) as csv_file:
+      reader = DictReader(csv_file)
+      fields = [
+          "text",
+          "sentiment",
+          "activation",
+          "predicted_sentiment",
+          "predicted_activation",
+      ]
+      writer = DictWriter(sys.stdout, fieldnames=fields)
+      writer.writeheader()
+      for row in reader:
+        line = row["text"].strip().lower()
+        sequences = pad_sequence(
+          sequences=[
+            torch.tensor(
+              tokenizer.encode(
+                line,
+                add_special_tokens=True,
+                max_length=args.max_sequence_length,
+              )
+            )
+          ],
+          batch_first=True,
+        ).to(device)
+        activation, sentiment = (
+            survey_model(sequences).cpu().detach().tolist()[0]
+        )
+        activation = denormalize_to_one_six(activation)
+        sentiment = denormalize_to_one_six(sentiment)
+        writer.writerow({
+          "text": row["text"],
+          "sentiment": row["sentiment"] if "sentiment" in row else "N/A",
+          "activation": row["activation"] if "activation" in row else "N/A",
+          "predicted_sentiment": sentiment,
+          "predicted_activation": activation,
+        })

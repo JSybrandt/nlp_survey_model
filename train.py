@@ -2,6 +2,7 @@
 
 import torch
 from transformers import BertModel, BertTokenizer
+from typing import Dict, Any
 from argparse import ArgumentParser
 from pathlib import Path
 from csv import DictReader
@@ -13,31 +14,48 @@ from itertools import zip_longest
 import pickle
 from copy import deepcopy, copy
 import numpy as np
+import horovod.torch as hvd
 
 BERT_OUTPUT_DIM = 768
 
-class SurveyClassifier(torch.nn.Module):
-  def __init__(self):
-    super(SurveyClassifier, self).__init__()
-    # Must transform a dense layer of size BERT_OUTPUT_DIM to
-    # TrainingData.labels (relevant, activation, sentiment)
+class SurveyClassifier(BertModel):
+  def __init__(self, config:Dict[str, Any], freeze_bert_layers=True):
+    super(SurveyClassifier, self).__init__(config)
+    for param in self.parameters():
+      param.requires_grad = not freeze_bert_layers
 
     # input
-    self.l1 = torch.nn.Linear(BERT_OUTPUT_DIM, 16)
+    # self.drop = torch.nn.Dropout(p=0.2)
+    self.l1 = torch.nn.Linear(BERT_OUTPUT_DIM, 2)
     self.r1 = torch.nn.ReLU(inplace=True)
-    # # batch 1
-    self.l2 = torch.nn.Linear(16, 3)
-    self.r2 = torch.nn.ReLU(inplace=True)
 
     # Order matters
     self.ops = [
+        # self.drop,
         self.l1,
         self.r1,
-        self.l2,
-        self.r2,
     ]
 
-  def forward(self, x):
+  def unfreeze_layers_starting_with(self, level:int):
+    assert level >= 0
+    assert level <= 11
+    for name, param in self.named_parameters():
+      tokens = name.split(".")
+      if ((
+            tokens[0] == "encoder"
+            and tokens[1] == "layer"
+            and int(tokens[2]) >= level
+          )
+          or (
+            tokens[0] == "pooler"
+            and tokens[1] == "dense"
+          )
+      ):
+        param.requires_grad = True
+
+  def forward(self, *args, **kwargs):
+    x =  super(SurveyClassifier, self).forward(*args, **kwargs)[0]
+    x = x.sum(dim=1) / x.shape[1]
     for op in self.ops:
       x = op(x)
     return x
@@ -45,7 +63,7 @@ class SurveyClassifier(torch.nn.Module):
 ################################################################################
 
 def binary_accuracy(prediction, labels):
-  num_correct = ((prediction > 0.5) == (labels > 0.5)).sum()
+  num_correct = ((prediction > 0.5) == (labels > 0.5)).sum().float()
   return num_correct / prediction.numel()
 
 def per_class_accuracy(prediction, labels):
@@ -56,7 +74,7 @@ def per_class_accuracy(prediction, labels):
     val *= 5
     val += 1
     return val.round()
-  return (denorm(prediction) == denorm(labels)).sum() / prediction.numel()
+  return (denorm(prediction) == denorm(labels)).sum().float() / prediction.numel()
 
 
 def bert_to_sentence_embeddings(bert_model, tokenizer, sequences):
@@ -69,33 +87,24 @@ def normalize_to_zero_one(one_six):
 
 def denormalize_to_one_six(zero_one):
   zero_one = max(0, min(1, zero_one))
-  return int(np.round(zero_one * 5 + 1))
+  return zero_one * 5 + 1
 
 class TrainingData(object):
-  def __init__(self, text, relevant, activation, sentiment):
+  def __init__(self, text, activation, sentiment):
     self.text = text
-    self.relevant = float(relevant) if relevant != "" else None
     self.activation = float(activation) if activation != "" else None
     self.sentiment = float(sentiment) if sentiment != "" else None
     self.embedding = None
     self.labels = None
     if self.is_complete():
       self.labels = torch.FloatTensor([
-        self.relevant,
         normalize_to_zero_one(self.activation),
         normalize_to_zero_one(self.sentiment),
       ])
 
-  def set_embedding(self, embedding):
-    self.embedding = torch.FloatTensor(embedding)
-
-  def get_embedding(self):
-    return self.embedding
-
   def is_complete(self):
     return (
-        self.relevant is not None
-        and self.activation is not None
+        self.activation is not None
         and self.sentiment is not None
     )
 
@@ -108,188 +117,162 @@ def iter_to_batches(iterable, batch_size):
   for batch in zip_longest(*args):
     yield list(filter(lambda b: b is not None, batch))
 
+def split_by_rank(data):
+  points_per_rank = int(len(data) / hvd.size())
+  first = hvd.rank() * points_per_rank
+  last = first + points_per_rank
+  return data[first:last]
+
 def get_args():
   parser = ArgumentParser()
   parser.add_argument("--pretrained-weights", default="bert-base-uncased")
-  parser.add_argument("--raw-data", type=Path, default=Path("./data.csv"))
-  parser.add_argument(
-      "--processed-data",
-      type=Path,
-      default=Path("./processed_data.pkl")
-  )
+  parser.add_argument("--raw-data", type=Path, nargs="+", default=[
+    Path("./data/tiffany.csv"),
+    Path("./data/justin.csv"),
+    Path("./data/mike.csv"),
+  ])
   parser.add_argument("--model", type=Path, default=Path("./model.pt"))
-  parser.add_argument("--batch-size", type=int, default=16)
+  parser.add_argument("--batch-size", type=int, default=20)
   parser.add_argument("--disable-gpu", action="store_true")
-  parser.add_argument("--epochs", type=int, default=100)
-  parser.add_argument("--max-sequence_length", type=int, default=400)
-  parser.add_argument("--test-ratio", type=float, default=0.2)
-  parser.add_argument("--validation-ratio", type=float, default=0.2)
-  parser.add_argument("--learning-rate", type=float, default=0.001)
+  parser.add_argument("--epochs", type=int, default=20)
+  parser.add_argument("--unfreeze-bert-epoch", type=int, default=5)
+  parser.add_argument("--max-sequence_length", type=int, default=500)
+  parser.add_argument("--validation-ratio", type=float, default=0.1)
+  parser.add_argument("--learning-rate", type=float, default=0.002)
   return parser.parse_args()
+
+
 
 ################################################################################
 
 if __name__ == "__main__":
   args = get_args()
 
+  seed = 42
+  hvd.init()
+
+  torch.manual_seed(seed)
+  torch.cuda.manual_seed(seed)
+  torch.set_num_threads(1)
+  torch.cuda.set_device(hvd.local_rank())
+
   print("Configuring pytorch")
   if torch.cuda.is_available() and not args.disable_gpu:
     device = torch.device("cuda")
   else:
     device = torch.device("cpu")
-    torch.cuda.empty_cache()
 
-  if args.processed_data.is_file():
-    print(f"Loading previously-processed data from {args.processed_data}")
-    with open(args.processed_data, 'rb') as data_file:
-      training_data, validation_data, testing_data = pickle.load(data_file)
-  else:
-    print("Preprocessing all data")
-    all_data = []
-    assert args.raw_data.is_file()
-    with open(args.raw_data) as csv_file:
+  print("Preprocessing all data")
+  training_data = []
+  for data_path in args.raw_data:
+    assert data_path.is_file()
+    with open(data_path) as csv_file:
       reader = DictReader(csv_file)
       for row in reader:
-        all_data.append(
+        training_data.append(
             TrainingData(
               text=row["text"],
-              relevant=row["relevant"],
               activation=row["activation"],
               sentiment=row["sentiment"],
             )
         )
-    print(f"Loaded {len(all_data)} values from {args.raw_data}")
+  print(f"Loaded {len(training_data)} values from {args.raw_data}")
 
-    print(f"Filtering to only labeled data")
-    all_data = list(filter(lambda x: x.is_complete(), all_data))
-    print(f"Number of labeled points: {len(all_data)}")
+  print(f"Filtering to only labeled data")
+  training_data = list(filter(lambda x: x.is_complete(), training_data))
+  print(f"Number of labeled points: {len(training_data)}")
 
-    print(
-        f"Loading {args.pretrained_weights}. This will download weights the "
-        "first time."
-    )
-    tokenizer = BertTokenizer.from_pretrained(args.pretrained_weights)
-    embedding_model = BertModel.from_pretrained(args.pretrained_weights)
-    embedding_model.eval()
-
-    print(f"Sending model to compute device: {device}")
-    embedding_model = embedding_model.to(device)
-
-    print("Performing initial embedding")
-    for batch in tqdm(
-        iter_to_batches(all_data, args.batch_size),
-        total=int(len(all_data)/args.batch_size)
-    ):
-      sequences = pad_sequence(
-          sequences=[
-            torch.tensor(
-              tokenizer.encode(
-                b.text,
-                add_special_tokens=True
-              )[:args.max_sequence_length]
-            )
-            for b in batch
-          ],
-          batch_first=True,
-      ).to(device)
-      embeddings = (
-          bert_to_sentence_embeddings(
-            embedding_model,
-            tokenizer,
-            sequences
-          )
-          .cpu()
-          .detach()
-          .numpy()
-      )
-      for element, embedding in zip(batch, embeddings):
-        element.set_embedding(embedding)
-
-    del embedding_model
-
-    print("Shuffling")
-    shuffle(all_data)
-
-    print("Splitting to train - validation - test")
-    training_data, testing_data = train_test_split(
-        all_data,
-        test_size=args.test_ratio
-    )
-    training_data, validation_data = train_test_split(
-        training_data,
-        test_size=args.validation_ratio
-    )
-
-    print(f"Saving training/validation/testing data to {args.processed_data}")
-    with open(args.processed_data, 'wb') as data_file:
-      pickle.dump([training_data, validation_data, testing_data], data_file)
-
-  print(
-      f"Split sizes: {len(training_data)}"
-      f" - {len(validation_data)}"
-      f" - {len(testing_data)}"
+  training_data, validation_data = train_test_split(
+      training_data,
+      test_size=args.validation_ratio
   )
+  training_data = split_by_rank(training_data)
+  validation_data = split_by_rank(validation_data)
+
+
+  tokenizer = BertTokenizer.from_pretrained(args.pretrained_weights)
+  model = SurveyClassifier.from_pretrained(args.pretrained_weights)
+  model.to(device)
+  hvd.broadcast_parameters(model.state_dict(), root_rank=0)
+
+  print("Shuffling")
+  shuffle(training_data)
 
   ##############################################################################
 
   print("Training specialty model")
-  model = SurveyClassifier().to(device)
   loss_fn = torch.nn.MSELoss()
   optimizer = torch.optim.Adam(
       filter(lambda x: x.requires_grad, model.parameters()),
-      lr=args.learning_rate,
+      lr=args.learning_rate * hvd.size(),
   )
+  optimizer = hvd.DistributedOptimizer(
+      optimizer,
+      named_parameters=model.named_parameters(),
+  )
+  hvd.broadcast_optimizer_state(optimizer, root_rank=0)
+
 
   best_validation_loss = None
   best_model = None
-
   for epoch in range(args.epochs):
-    shuffle(training_data)
-    for phase in ["train", "validate", "test"]:
+    if epoch  == args.unfreeze_bert_epoch:
+      model.unfreeze_layers_starting_with(11)
+    if epoch  == args.unfreeze_bert_epoch*2:
+      model.unfreeze_layers_starting_with(10)
+    for phase in ["train", "validate"]:
       if phase == "train":
         model.train()
+        shuffle(training_data)
         data = training_data
       elif phase == "validate":
         model.eval()
         data = validation_data
-      elif phase == "test":
-        if epoch != args.epochs-1:
-          continue
-        assert best_model is not None
-        model = best_model
-        model.eval()
-        data = testing_data
 
       # Defining a progress bar link this so we can alter the description
-      pbar = tqdm(
-          iter_to_batches(data, args.batch_size),
-          total=int(len(data)/float(args.batch_size)),
-      )
       running_loss = 0.0
-      running_rel_2acc = 0.0
       running_act_2acc = 0.0
       running_sent_2acc = 0.0
       running_act_6acc = 0.0
       running_sent_6acc = 0.0
       running_count = 0.0
-      for batch in pbar:
-        batch_embeddings = (
-            torch.stack([x.get_embedding() for x in batch])
-            .to(device)
-        )
-        batch_labels = (
-            torch.stack([x.get_labels() for x in batch])
-            .to(device)
-        )
-        batch_predictions = model(batch_embeddings)
+      for batch in iter_to_batches(data, args.batch_size):
+        batch_seqs = pad_sequence(
+            sequences=[
+              torch.tensor(
+                tokenizer.encode(
+                  b.text,
+                  add_special_tokens=True,
+                  max_length=args.max_sequence_length,
+                )
+              )
+              for b in batch
+            ],
+            batch_first=True,
+        ).to(device)
+        batch_mask = torch.ones_like(batch_seqs)
+        # Mask out the padding tokens
+        batch_mask[batch_seqs==0] = 0
+        batch_labels = torch.stack([x.get_labels() for x in batch]).to(device)
+        batch_predictions = model(batch_seqs, attention_mask=batch_mask)
         batch_loss = loss_fn(batch_predictions, batch_labels)
 
-        running_rel_2acc += binary_accuracy(batch_predictions[:, 0], batch_labels[:, 0])
-        running_act_2acc += binary_accuracy(batch_predictions[:, 1], batch_labels[:, 1])
-        running_sent_2acc += binary_accuracy(batch_predictions[:, 2], batch_labels[:, 2])
-
-        running_act_6acc += per_class_accuracy(batch_predictions[:, 1], batch_labels[:, 1])
-        running_sent_6acc += per_class_accuracy(batch_predictions[:, 2], batch_labels[:, 2])
+        running_act_2acc += binary_accuracy(
+            batch_predictions[:, 0],
+            batch_labels[:, 0]
+        )
+        running_sent_2acc += binary_accuracy(
+            batch_predictions[:, 1],
+            batch_labels[:, 1]
+        )
+        running_act_6acc += per_class_accuracy(
+            batch_predictions[:, 0],
+            batch_labels[:, 0]
+        )
+        running_sent_6acc += per_class_accuracy(
+            batch_predictions[:, 1],
+            batch_labels[:, 1]
+        )
 
         if phase == "train":
           optimizer.zero_grad()
@@ -298,22 +281,25 @@ if __name__ == "__main__":
 
         running_loss += batch_loss.detach()
         running_count += 1
-        pbar.set_description(
-            f"{phase}"
-            f" -- Loss:{running_loss / running_count:0.3f}"
-            f" -- Rel2:{running_rel_2acc / running_count:0.3f}"
-            f" -- Act2:{running_act_2acc / running_count:0.3f}"
-            f" -- Sen2:{running_sent_2acc / running_count:0.3f}"
-            f" -- Act6:{running_act_6acc / running_count:0.3f}"
-            f" -- Sen6:{running_sent_6acc / running_count:0.3f}"
-        )
+        if hvd.rank() == 0:
+          print(
+              f"{epoch} - {phase}"
+              f" -- Loss:{running_loss / running_count:0.3f}"
+              f" -- Act2:{running_act_2acc / running_count:0.3f}"
+              f" -- Act6:{running_act_6acc / running_count:0.3f}"
+              f" -- Sen2:{running_sent_2acc / running_count:0.3f}"
+              f" -- Sen6:{running_sent_6acc / running_count:0.3f}"
+          )
 
       if phase == "validate":
         epoch_loss = running_loss / running_count
+        epoch_loss = hvd.allreduce(epoch_loss, name=f"epoch_loss")
+        if hvd.rank() == 0:
+          print(epoch_loss)
         if best_validation_loss is None or epoch_loss < best_validation_loss:
           best_validation_loss = epoch_loss
           best_model = deepcopy(model)
-          print("Updating best model")
 
-  print(f"Saving model to {args.model}")
-  torch.save(best_model.state_dict(), args.model)
+  if hvd.rank() == 0:
+    print(f"Saving model to {args.model}")
+    torch.save(best_model.state_dict(), args.model)
